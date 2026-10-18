@@ -1,0 +1,162 @@
+name: ragent-p0
+
+# ============================================================================
+# P0 依赖栈：PostgreSQL(pgvector) + Redis + RustFS，RocketMQ 按需
+#
+# 端口与账号全部对齐 ragent/bootstrap/src/main/resources/application.yaml 的默认值，
+# 所以后端不用改任何连接配置就能连上（配套的覆盖项见同目录 application-local.yaml）。
+#
+# 账号口令一律从同目录 .env 读（.env 已 gitignore，不入库）：
+#   cp .env.example .env   然后按需改成实际值；application-local.yaml 用同名变量，两边不会跑偏。
+#
+#   首次准备          cp .env.example .env
+#   启动              docker compose up -d
+#   起 RocketMQ       docker compose --profile mq up -d
+#   看某个容器        docker compose logs -f rmqbroker
+#   进 PG             docker compose exec -it postgres psql -U postgres -d ragent
+#   清空重来          docker compose down -v        # -v 会删数据卷，确认可删再按
+#
+# PG 首次启动（数据卷为空时）会自动执行 ragent 仓库里的建表与初始数据脚本。
+# 想重新初始化：docker compose down -v && docker compose up -d
+#
+# 资源占用参考：pg ~200MB / redis ~20MB / rustfs ~100MB，
+# 加上 mq 两个容器（namesrv 400MB + broker 512MB）共约 1.3GB。
+# ============================================================================
+
+services:
+
+  # ---------------------------------------------------------------- 业务库 + 向量库
+  # 一个库两用：业务表在 ragent 的 schema_pg.sql 里，向量表 t_knowledge_vector 的
+  # embedding 列是 vector(1536)，所以 rag.default.dimension 必须保持 1536。
+  # 注意镜像不能用官方 postgres:17 —— 它不带 pgvector，建表会在 CREATE EXTENSION vector 就失败。
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: ragent-pg
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ../ragent/resources/database/schema_pg.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ../ragent/resources/database/init_data_pg.sql:/docker-entrypoint-initdb.d/02_data.sql:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d ragent" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- 缓存 / 排队 / 分布式锁
+  # 意图树缓存、会话缓存、SSE 跨节点取消的 Pub/Sub、Redis 公平排队都用它。
+  # 无 requirepass，只绑 127.0.0.1，不出宿主机。仓库 application.yaml 里写死了 password: 123456，
+  # 服务端没密码时 Lettuce 发 AUTH 会收到 "Client sent AUTH, but no password is set" 并连接失败，
+  # 所以 application-local.yaml 必须把它覆盖成空串（见那边的 spring.data.redis.password）。
+  # 另外：这台机 systemd 已起了一个 redis-server 占着 6379，要用本容器得先 systemctl stop redis-server。
+  redis:
+    image: redis:7
+    container_name: ragent-redis
+    command: redis-server --appendonly no
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: [ "CMD-SHELL", "redis-cli ping | grep -q PONG" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- 对象存储（S3 兼容）
+  # ragent 里 RustFS 承担两个角色：Milvus 的底层存储 + 应用自己的文档存储。
+  # 这里 vector.type=pg、不起 Milvus，所以只给它一个容器，不为它白跑 etcd+milvus+attu。
+  # 桶不用手动建：rag/config/StorageInitializer.java 启动时 bucketExists → createBucket，
+  # 自动创建 ragent-sources（私有，知识库原文）和 ragent-assets（公共读，PDF 抽出的图片）。
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.72
+    container_name: rustfs
+    command:
+      - "--address"
+      - ":9000"
+      - "--console-enable"
+      - "--access-key"
+      - "${RUSTFS_ACCESS_KEY}"
+      - "--secret-key"
+      - "${RUSTFS_SECRET_KEY}"
+      - "/data"
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001"   # 控制台 http://localhost:9001
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -qO- http://localhost:9000/ || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- 消息队列（profile: mq）
+  # 上传文档后的分块是 RocketMQ 事务消息驱动的（knowledge/mq/KnowledgeDocumentChunkConsumer
+  # → executeChunk），代码里没有本地降级开关。所以只做问答链路时不用起，一旦要验证入库分块
+  # 就必须起：docker compose --profile mq up -d
+  # brokerIP1=127.0.0.1 是关键：broker 向 namesrv 注册成宿主机可达地址，宿主机上的应用才连得上。
+  rmqnamesrv:
+    image: apache/rocketmq:5.2.0
+    container_name: rmqnamesrv
+    profiles: [ "mq" ]
+    ports:
+      - "127.0.0.1:9876:9876"
+    environment:
+      JAVA_OPT_EXT: "-Xms256m -Xmx400m"
+    command: sh mqnamesrv
+    healthcheck:
+      test: [ "CMD-SHELL", "grep -q 'The Name Server boot success' /home/rocketmq/logs/rocketmqlogs/namesrv.log || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  rmqbroker:
+    image: apache/rocketmq:5.2.0
+    container_name: rmqbroker
+    profiles: [ "mq" ]
+    ports:
+      - "127.0.0.1:10911:10911"
+      - "127.0.0.1:10909:10909"
+    environment:
+      NAMESRV_ADDR: "rmqnamesrv:9876"
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m"
+    depends_on:
+      rmqnamesrv:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        cat > /home/rocketmq/rocketmq-5.2.0/conf/broker.conf << EOF
+        brokerClusterName = DefaultCluster
+        brokerName = broker-a
+        brokerId = 0
+        deleteWhen = 04
+        fileReservedTime = 48
+        brokerRole = ASYNC_MASTER
+        flushDiskType = ASYNC_FLUSH
+        brokerIP1 = 127.0.0.1
+        timerMaxDelaySec = 31622400
+        EOF
+        sh mqbroker --enable-proxy \
+          -c /home/rocketmq/rocketmq-5.2.0/conf/broker.conf
+    volumes:
+      - rmq-data:/home/rocketmq/store
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  rustfs-data:
+  rmq-data:

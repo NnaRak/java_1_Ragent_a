@@ -1,0 +1,105 @@
+# ============================================================================
+# Ragent P0/P1 本地覆盖项（配合同目录 docker-compose.yaml）
+#
+# 不改动 ragent 仓库，作为额外配置源加载（additional-location 优先级高于
+# classpath 的 application.yaml，同名键以本文件为准）：
+#
+#   export BAILIAN_API_KEY=sk-你的百炼key
+#   set -a; source /home/naraka/project1java/project_1_java_ragent/.env; set +a
+#   cd /home/naraka/project1java/ragent
+#   ./mvnw -pl bootstrap -am spring-boot:run \
+#     -Dspring-boot.run.arguments="--spring.config.additional-location=file:///home/naraka/project1java/project_1_java_ragent/application-local.yaml"
+#
+# 本文件里 ${RUSTFS_ACCESS_KEY} / ${RUSTFS_SECRET_KEY} 这类占位符只从进程环境变量取值，
+# 上面那行 source .env 漏了的话，启动会报 "Could not resolve placeholder"。
+#
+# IDEA 里更省事：Run/Debug Configurations → Application → Program arguments 填
+#   --spring.config.additional-location=file:///home/naraka/project1java/project_1_java_ragent/application-local.yaml
+# 注意 file:/// 三个斜杠。Environment variables 里再补上 RUSTFS_ACCESS_KEY、RUSTFS_SECRET_KEY
+# 两项（或装 EnvFile 插件直接指向同目录 .env）。
+#
+# 起停依赖：docker compose up -d   （服务在 http://localhost:9090/api/ragent）
+# ============================================================================
+
+ragent:
+  engine:
+    type: workflow      # v1 固定编排链路，P0/P1 先用它读懂 RAG；P4 阶段改 agent 跑 ReAct
+
+rag:
+  # -------------------------------------------------- 存储：全部降级到本地三容器
+  vector:
+    type: pg            # pgvector 顶掉 Milvus（省 4 个容器；接口同为 VectorStoreService）
+  keyword:
+    type: none          # 不起 ES。P2 做混合检索时改成 es 并起 elasticsearch:8.17
+  graph:
+    type: none          # 不起 LightRAG/Neo4j，MVP 范围内不做图谱
+  storage:
+    type: s3            # 指 S3 协议，不是必须 AWS；这里是本地 RustFS
+    s3:
+      endpoint: http://localhost:9000
+      access-key: ${RUSTFS_ACCESS_KEY}
+      secret-key: ${RUSTFS_SECRET_KEY}
+      region: us-east-1
+      path-style: true
+
+  # -------------------------------------------------- 维度：不要随手改
+  default:
+    dimension: 1536     # 必须等于 schema_pg.sql 里 t_knowledge_vector.embedding 的 vector(1536)。
+                        # 换 4096 维的本地 embedding 模型会直接写入报错，届时要一起改建表脚本。
+    sse-timeout-ms: 300000
+
+  # -------------------------------------------------- 检索漏斗：只留向量这一路
+  # 三段预算 recall-budget(20) → rerank-candidate-limit(40) → default-top-k(10) 保持默认，
+  # 启动时会做单调性校验（recall ≥ topK 且 candidate ≥ topK），配错直接启动失败。
+  search:
+    channels:
+      vector:
+        enabled: true
+      keyword:
+        enabled: false
+      graph:
+        enabled: false
+      web-search:
+        enabled: false
+
+  # -------------------------------------------------- 调试期关掉全局限流
+  # 默认允许 10 并发、最多等 5 秒、租约 300 秒。断点停在模型调用上时，
+  # 后面的请求会排队甚至抢不到令牌，表现成「莫名其妙卡住」，容易误判成代码问题。
+  rate-limit:
+    global:
+      enabled: false
+
+  rerank:
+    enabled: true       # 走百炼 qwen3-rerank；没有百炼 key 就置 false 先跳过精排，
+                        # P2 的对比实验有一组就是「Rerank 开 vs 关」，两种都要跑
+
+# ============================================================================
+# 模型：一条链路最少需要 chat + embedding 两种能力
+# ============================================================================
+# 只用一个 key 的话，阿里云百炼最省事：chat(qwen-plus) / embedding(text-embedding-v4) /
+# rerank(qwen3-rerank) / vlm(qwen-vl-max) 全在 ai.providers.bailian 下，仓库默认已配好，
+# 只需 export BAILIAN_API_KEY。
+#
+# 只有 DeepSeek key 的注意：deepseek 供应商只有 chat 端点（application.yaml:223-227），
+# 没有 embedding 也没有 rerank。问答链路没有 embedding 就写不进向量，跑不通。
+# 这种情况下要么补一个百炼/aihubmix key 专供 embedding，要么起本地 Ollama：
+#   ollama pull qwen3:8b-fp16 && ollama pull qwen3-embedding:8b
+# 并把 ai.embedding.default-model 指到 qwen-emb-local —— 但本地 8b embedding 是 4096 维，
+# 要同时改 rag.default.dimension 和向量表列定义，P0 不建议动。
+#
+# 想换模型档位（ai.chat.tiers）也写在本文件里追加覆盖，list 类型属性是整体替换、不是合并。
+
+# ============================================================================
+# Redis：仓库 application.yaml 的 spring.data.redis.password 写死 123456，而这台机
+# 6379 上是 systemd 起的 redis-server，没配 requirepass。带密码去连，Lettuce 建连接时发的
+# AUTH 会被服务端以 "Client sent AUTH, but no password is set" 拒绝，属于启动即失败。
+# 空串 → RedisPassword.none() → 不发 AUTH。改用本目录 compose 的 redis:7 时同样适用（它也没密码）。
+# ============================================================================
+spring:
+  data:
+    redis:
+      password: ""
+
+logging:
+  level:
+    com.nageoffer.ai.ragent: DEBUG   # 看检索归因、通道耗时、RRF/精排分数分布，P2 调参主要靠它
