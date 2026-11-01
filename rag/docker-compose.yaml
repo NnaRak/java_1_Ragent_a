@@ -1,0 +1,49 @@
+name: rag-agent
+
+# 新 agent 独立依赖栈：不占用 ragent 的 5432 / 9000，也不挂 ragent 的建表脚本。
+# 启动：docker compose -f rag/docker-compose.yaml up -d
+# 停止：docker compose -f rag/docker-compose.yaml down        （加 -v 会删数据卷）
+# 表结构由应用启动时执行 classpath:db/schema.sql 自动创建。
+
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: rag-agent-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rag_agent
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rag_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: rag-agent-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: rustfsadmin
+      MINIO_ROOT_PASSWORD: rustfsadmin
+    ports:
+      - "127.0.0.1:9100:9000"
+      - "127.0.0.1:9101:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  minio-data:
